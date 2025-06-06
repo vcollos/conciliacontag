@@ -1,0 +1,1 @@
+# Constantes globais do sistema 
