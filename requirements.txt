@@ -1,4 +1,6 @@
 ofxparse
 pandas
 streamlit
-xlrd 
+xlrd
+numpy
+openpyxl 
