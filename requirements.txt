@@ -1,0 +1,4 @@
+ofxparse
+pandas
+streamlit
+xlrd 
