@@ -76,4 +76,13 @@ coverage.xml
 
 # Ignore arquivos de configuração pessoais
 *.env
-.env.* 
+.env.*
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/ 

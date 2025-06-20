@@ -3,4 +3,7 @@ pandas
 streamlit
 xlrd
 numpy
-openpyxl 
+openpyxl
+python-dotenv
+sqlalchemy
+psycopg2-binary 

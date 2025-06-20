@@ -6,8 +6,115 @@ from datetime import datetime
 from ofxparse import OfxParser
 import io
 import zipfile
-import unicodedata
-from difflib import SequenceMatcher
+import os
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+
+# Carregar variáveis de ambiente do arquivo .env
+load_dotenv()
+
+# --- Conexão com o Banco de Dados (PostgreSQL) ---
+def init_connection():
+    """Inicializa a conexão com o banco de dados PostgreSQL"""
+    try:
+        db_url = (
+            f"postgresql+psycopg2://{os.getenv('SUPABASE_USER')}:"
+            f"{os.getenv('SUPABASE_PASSWORD')}@{os.getenv('SUPABASE_HOST')}:"
+            f"{os.getenv('SUPABASE_PORT')}/{os.getenv('SUPABASE_DB_NAME')}"
+        )
+        engine = create_engine(db_url)
+        return engine
+    except Exception as e:
+        st.error(f"Erro ao conectar com o banco de dados: {e}")
+        st.info("Verifique se as variáveis de ambiente (HOST, USER, PASSWORD, etc.) estão corretas no arquivo .env.")
+        st.stop()
+
+engine = init_connection()
+
+# --- Funções do Banco de Dados ---
+def get_empresas():
+    """Busca todas as empresas cadastradas no banco de dados"""
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT id, nome, razao_social, cnpj FROM empresas ORDER BY nome"))
+            return [dict(row._mapping) for row in result]
+    except Exception as e:
+        st.error(f"Erro ao buscar empresas: {e}")
+        return []
+
+def cadastrar_empresa(nome, razao_social, cnpj):
+    """Cadastra uma nova empresa no banco de dados"""
+    try:
+        with engine.connect() as conn:
+            query = text("INSERT INTO empresas (nome, razao_social, cnpj) VALUES (:nome, :razao_social, :cnpj)")
+            conn.execute(query, {"nome": nome, "razao_social": razao_social, "cnpj": cnpj})
+            conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"Erro ao cadastrar empresa. Verifique se o CNPJ já existe. Detalhes: {e}")
+        return None
+
+def atualizar_empresa_ativa():
+    """Callback para atualizar a empresa ativa no session_state quando o selectbox muda."""
+    empresa_selecionada_nome = st.session_state.empresa_selectbox
+    if empresa_selecionada_nome:
+        lista_empresas = get_empresas()
+        map_empresas = {empresa['nome']: empresa for empresa in lista_empresas}
+        st.session_state['empresa_ativa'] = map_empresas[empresa_selecionada_nome]
+
+# --- Interface da Sidebar ---
+with st.sidebar:
+    st.title("Gestão de Empresas")
+
+    # Inicializa o modo da sidebar
+    if 'modo_sidebar' not in st.session_state:
+        st.session_state.modo_sidebar = 'selecionar'
+
+    # --- MODO DE SELEÇÃO ---
+    if st.session_state.modo_sidebar == 'selecionar':
+        lista_empresas = get_empresas()
+        map_empresas = {empresa['nome']: empresa for empresa in lista_empresas}
+        nomes_empresas = list(map_empresas.keys())
+
+        # Define o índice padrão do selectbox para a empresa ativa (se houver)
+        index_atual = 0
+        if 'empresa_ativa' in st.session_state and st.session_state['empresa_ativa']['nome'] in nomes_empresas:
+            index_atual = nomes_empresas.index(st.session_state['empresa_ativa']['nome'])
+        
+        st.selectbox(
+            "Selecione a Empresa",
+            options=nomes_empresas,
+            index=index_atual,
+            on_change=atualizar_empresa_ativa,
+            key='empresa_selectbox'
+        )
+
+        if st.button("Cadastrar"):
+            st.session_state.modo_sidebar = 'cadastrar'
+            st.rerun()
+
+    # --- MODO DE CADASTRO ---
+    elif st.session_state.modo_sidebar == 'cadastrar':
+        with st.form("cadastro_empresa_form"):
+            st.subheader("Cadastro de Nova Empresa")
+            novo_cnpj = st.text_input("CNPJ (apenas números)")
+            nova_razao_social = st.text_input("Razão Social")
+            novo_nome = st.text_input("Nome")
+            
+            if st.form_submit_button("Salvar"):
+                if novo_cnpj and nova_razao_social and novo_nome:
+                    resultado = cadastrar_empresa(novo_nome, nova_razao_social, novo_cnpj)
+                    if resultado:
+                        st.success(f"Empresa '{novo_nome}' cadastrada!")
+                        st.session_state.modo_sidebar = 'selecionar'
+                        st.rerun()
+                else:
+                    st.warning("Por favor, preencha todos os campos.")
+        
+        if st.button("Cancelar"):
+            st.session_state.modo_sidebar = 'selecionar'
+            st.rerun()
+
 
 # Configuração da página
 st.set_page_config(
@@ -16,39 +123,17 @@ st.set_page_config(
     layout="wide"
 )
 
+# Exibir empresa ativa no topo da página principal
+if 'empresa_ativa' in st.session_state:
+    st.header(f"🏢 Empresa Ativa: {st.session_state['empresa_ativa']['nome']}")
+else:
+    st.header("🏢 Nenhuma empresa selecionada")
+    st.info("Por favor, selecione ou cadastre uma empresa na barra lateral para começar.")
+
 st.title("💰 Processador de Extratos Financeiros")
 st.markdown("### Converte arquivos OFX (extratos) e XLS (francesinhas) para CSV")
 
-# ===== CAMPO CONTA DÉBITO BANCO =====
-st.markdown("#### ⚙️ Configuração Contábil")
-conta_debito_banco = st.text_input(
-    "CONTA DÉBITO BANCO",
-    value="",
-    placeholder="Ex: 11121001",
-    help="Conta que será usada como débito no arquivo contabilidade.csv",
-    key="conta_debito"
-)
-
-if conta_debito_banco:
-    st.success(f"✅ Conta débito configurada: **{conta_debito_banco}**")
-
 st.markdown("---")
-
-# Função para normalizar texto (remover acentos e deixar uppercase)
-def normalizar_texto(texto):
-    """Remove acentos e deixa texto em uppercase para comparação"""
-    if pd.isna(texto) or texto == '':
-        return ''
-    
-    # Converter para string
-    texto = str(texto)
-    
-    # Remover acentos
-    texto_sem_acento = unicodedata.normalize('NFD', texto)
-    texto_sem_acento = ''.join(char for char in texto_sem_acento if unicodedata.category(char) != 'Mn')
-    
-    # Uppercase e limpar espaços extras
-    return texto_sem_acento.upper().strip()
 
 # Função para processar OFX
 def processar_ofx(arquivo_ofx):
@@ -156,224 +241,6 @@ def processar_francesinha_xls(arquivo_xls):
         st.error(f"Erro ao processar Francesinha: {e}")
         return None
 
-# Função para processar plano de contas e gerar contabilidade
-def gerar_contabilidade(df_francesinhas, plano_contas_file, conta_debito_banco):
-    """Gera arquivo contabilidade.csv baseado na conciliação"""
-    try:
-        st.info("🔍 Iniciando leitura do plano de contas...")
-        
-        # Detectar tipo de arquivo
-        nome_arquivo = plano_contas_file.name.lower()
-        st.info(f"📄 Arquivo: {nome_arquivo}")
-        
-        df_plano = None
-        
-        if nome_arquivo.endswith('.csv'):
-            # Ler arquivo CSV COM cabeçalho
-            st.info("📄 Processando arquivo CSV...")
-            encodings = ['iso-8859-1', 'latin-1', 'cp1252', 'utf-8', 'utf-8-sig']
-            
-            for encoding in encodings:
-                try:
-                    plano_contas_file.seek(0)
-                    df_plano = pd.read_csv(
-                        plano_contas_file, 
-                        sep=';', 
-                        encoding=encoding, 
-                        header=0,  # COM cabeçalho
-                        on_bad_lines='skip'
-                    )
-                    if len(df_plano) > 0:
-                        st.success(f"✅ CSV lido com encoding: {encoding}")
-                        st.info(f"📋 Colunas encontradas: {list(df_plano.columns)}")
-                        break
-                except Exception as e:
-                    st.warning(f"❌ Falha com {encoding}: {str(e)}")
-                    continue
-            
-            # Usar índices numéricos das colunas diretamente
-            col_seq = 0           # Coluna 0 = Seq. (ignorar - sempre vazia)
-            col_auxiliar = 1      # Coluna 1 = Auxiliar (vai para CREDITO do contabilidade.csv)
-            col_contabil = 2      # Coluna 2 = Contábil (filtro por 123 após remover pontos)
-            col_descricao = 3     # Coluna 3 = Descrição (comparar com SACADO)
-            
-            st.info(f"📋 Estrutura do plano de contas CSV:")
-            st.info(f"   • Coluna {col_seq}: Seq. (ignorada)")
-            st.info(f"   • Coluna {col_auxiliar}: Auxiliar (→ CREDITO)")
-            st.info(f"   • Coluna {col_contabil}: Contábil (filtro 123)")  
-            st.info(f"   • Coluna {col_descricao}: Descrição (vs SACADO)")
-            
-        else:
-            # Ler arquivo Excel SEM cabeçalho
-            st.info("📊 Processando arquivo Excel...")
-            df_plano = pd.read_excel(plano_contas_file, header=None)
-            st.success("✅ Arquivo Excel lido com sucesso")
-            
-            # Para Excel: usar índices das colunas
-            col_auxiliar = 1    # Coluna B = Auxiliar
-            col_contabil = 2    # Coluna C = Contábil  
-            col_descricao = 3   # Coluna D = Descrição
-        
-        if df_plano is None or len(df_plano) == 0:
-            raise Exception("Não foi possível ler o arquivo")
-        
-        st.info(f"📋 Arquivo carregado: {len(df_plano)} linhas, {len(df_plano.columns)} colunas")
-        
-        # Mostrar primeiras linhas para debug
-        st.dataframe(df_plano.head(), use_container_width=True)
-        
-        # PROCESSAMENTO: Converter coluna contábil para string e remover pontos
-        st.info("🔧 Processando coluna Contábil (coluna 2 - removendo pontos)...")
-        
-        # Converter coluna contábil (índice 2) para string e remover pontos
-        df_plano['contabil_string'] = df_plano.iloc[:, col_contabil].astype(str)
-        df_plano['contabil_sem_pontos'] = df_plano['contabil_string'].str.replace('.', '', regex=False)
-        
-        # Mostrar antes e depois
-        st.info("📋 Exemplo de contas antes e depois da remoção dos pontos:")
-        for _, row in df_plano.head(10).iterrows():
-            original = row['contabil_string']
-            sem_pontos = row['contabil_sem_pontos']
-            st.text(f"   • '{original}' → '{sem_pontos}'")
-        
-        # FILTRO: Apenas contas que começam com "123"
-        linhas_123 = df_plano[df_plano['contabil_sem_pontos'].str.startswith('123', na=False)]
-        
-        # Filtrar também por descrição válida (coluna 3)
-        df_plano_filtrado = linhas_123[
-            linhas_123.iloc[:, col_descricao].notna() & 
-            (linhas_123.iloc[:, col_descricao] != '')
-        ]
-        
-        st.success(f"🎯 FILTRO APLICADO: {len(df_plano_filtrado)} registros do grupo 123 com descrição válida")
-        
-        if len(df_plano_filtrado) > 0:
-            st.info("📋 Amostra do grupo 123 filtrado:")
-            for _, row in df_plano_filtrado.head(15).iterrows():
-                seq = row.iloc[col_seq] if pd.notna(row.iloc[col_seq]) else 'vazio'
-                aux = row.iloc[col_auxiliar] if pd.notna(row.iloc[col_auxiliar]) else 'N/A'
-                cont_original = row['contabil_string']
-                cont_sem_pontos = row['contabil_sem_pontos']
-                desc = str(row.iloc[col_descricao])[:50] if pd.notna(row.iloc[col_descricao]) else 'N/A'
-                st.text(f"   • Seq:{seq} | Aux:{aux} | Cont:'{cont_original}'→'{cont_sem_pontos}' | Desc:{desc}")
-        else:
-            st.error("❌ Nenhum registro encontrado no grupo 123 com descrição válida!")
-            return pd.DataFrame()
-        
-        # OTIMIZAÇÃO: Criar índice de busca para acelerar comparações
-        st.info("🚀 Criando índice de busca para otimizar correspondências...")
-        
-        # Criar dicionário de busca normalizado
-        indice_busca = {}
-        for idx, row in df_plano_filtrado.iterrows():
-            descricao_norm = normalizar_texto(row.iloc[col_descricao])
-            if len(descricao_norm) >= 3:
-                indice_busca[descricao_norm] = row
-                
-                # Adicionar palavras-chave ao índice
-                palavras = [p for p in descricao_norm.split() if len(p) > 3]
-                for palavra in palavras:
-                    if palavra not in indice_busca:
-                        indice_busca[palavra] = []
-                    if isinstance(indice_busca[palavra], list):
-                        indice_busca[palavra].append(row)
-                    else:
-                        indice_busca[palavra] = [indice_busca[palavra], row]
-        
-        st.success(f"✅ Índice criado com {len(indice_busca)} entradas")
-        
-        registros_contabilidade = []
-        correspondencias_encontradas = 0
-        correspondencias_nao_encontradas = []
-        registros_sem_conta = []
-        
-        total_francesinhas = len(df_francesinhas)
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        for i, (_, row_francesinha) in enumerate(df_francesinhas.iterrows()):
-            # Atualizar progresso
-            progress = (i + 1) / total_francesinhas
-            progress_bar.progress(progress)
-            status_text.text(f"Processando {i+1}/{total_francesinhas} registros...")
-            
-            sacado = normalizar_texto(row_francesinha['Sacado'])
-            
-            # Pular se for linha de juros com valor 0
-            if row_francesinha['Arquivo_Origem'] == "Juros de Mora" and row_francesinha['Valor_RS'] == 0:
-                continue
-            
-            # Regra 1: Juros de Mora
-            if row_francesinha['Arquivo_Origem'] == "Juros de Mora":
-                credito = "31426"
-                historico = "20"
-            else:
-                # Tenta correspondência com plano de contas
-                correspondencia = None
-                melhor_score = 0
-                # Busca exata
-                if sacado in indice_busca:
-                    candidato = indice_busca[sacado]
-                    if not isinstance(candidato, list):
-                        correspondencia = candidato
-                        melhor_score = 1.0
-                # Busca por similaridade
-                if correspondencia is None:
-                    melhor_candidato = None
-                    melhor_sim = 0
-                    for idx2, row_plano in df_plano_filtrado.iterrows():
-                        descricao = normalizar_texto(row_plano.iloc[col_descricao])
-                        sim = similaridade(sacado, descricao)
-                        if sim > melhor_sim:
-                            melhor_sim = sim
-                            melhor_candidato = row_plano
-                    if melhor_sim >= 0.85:
-                        correspondencia = melhor_candidato
-                        melhor_score = melhor_sim
-                if correspondencia is not None:
-                    credito = str(correspondencia.iloc[col_auxiliar]).strip()
-                    historico = "104"
-                else:
-                    # Regra 2: Sem correspondência
-                    credito = "10550"
-                    historico = "104"
-            # Só gera registro se a conta de crédito for válida
-            if credito and credito not in ['0', 'nan', 'None', '']:
-                correspondencias_encontradas += 1
-                registro = {
-                    'DEBITO': conta_debito_banco,
-                    'CREDITO': credito,
-                    'HISTORICO': historico,
-                    'DATA': row_francesinha['Dt_Previsao_Credito'],
-                    'VALOR': row_francesinha['Valor_RS'],
-                    'COMPLEMENTO': row_francesinha['Sacado']
-                }
-                registros_contabilidade.append(registro)
-            else:
-                registros_sem_conta.append(f"{row_francesinha['Sacado']} → Auxiliar inválido: {credito}")
-        
-        # Limpar barra de progresso
-        progress_bar.empty()
-        status_text.empty()
-        
-        # Mostrar estatísticas detalhadas
-        st.info(f"📊 Resultados da geração do contabilidade.csv:")
-        st.info(f"   • ✅ Registros gerados: {correspondencias_encontradas}")
-        st.info(f"   • ⚠️ Sem conta válida: {len(registros_sem_conta)}")
-        
-        if registros_sem_conta:
-            st.warning("⚠️ Registros com conta inválida:")
-            for i, registro in enumerate(registros_sem_conta[:10]):
-                st.text(f"   • {registro}")
-            if len(registros_sem_conta) > 10:
-                st.text(f"   ... e mais {len(registros_sem_conta) - 10}")
-        
-        return pd.DataFrame(registros_contabilidade)
-        
-    except Exception as e:
-        st.error(f"Erro ao gerar contabilidade: {e}")
-        return None
-
 # Função para converter DataFrame para CSV
 def converter_para_csv(df):
     """Converte DataFrame para CSV em bytes"""
@@ -381,19 +248,7 @@ def converter_para_csv(df):
     df.to_csv(output, index=False, sep=';', encoding='utf-8-sig')
     return output.getvalue().encode('utf-8-sig')
 
-# Função para calcular similaridade entre strings
-def similaridade(a, b):
-    return SequenceMatcher(None, a, b).ratio()
-
 # Interface do Streamlit
-st.subheader("📋 Plano de Contas")
-plano_contas = st.file_uploader(
-    "Envie o plano de contas (Excel ou CSV)",
-    type=['xlsx', 'xls', 'csv'],
-    key="plano_contas",
-    help="Arquivo Excel/CSV com colunas: Seq, Auxiliar, Contábil, Descrição"
-)
-
 col1, col2 = st.columns(2)
 
 with col1:
@@ -433,18 +288,18 @@ with col1:
                 )
 
 with col2:
-    st.subheader("📋 Francesinhas XLS")
+    st.subheader("📋 Gerar Francesinha Completa")
     arquivos_xls = st.file_uploader(
-        "Envie arquivos XLS",
+        "Envie arquivos de francesinha (XLS)",
         type=['xls', 'xlsx'],
         accept_multiple_files=True,
         key="xls"
     )
     
     if arquivos_xls:
-        st.success(f"{len(arquivos_xls)} arquivo(s) XLS carregado(s)")
+        st.success(f"{len(arquivos_xls)} arquivo(s) de francesinha carregado(s)")
         
-        if st.button("Processar Francesinhas", type="primary"):
+        if st.button("Gerar Francesinha Completa", type="primary"):
             dados_francesinhas = []
             
             for arquivo in arquivos_xls:
@@ -493,48 +348,11 @@ with col2:
                 
                 csv_francesinhas = converter_para_csv(df_francesinhas_final)
                 st.download_button(
-                    label="⬇️ Download CSV Francesinhas",
+                    label="⬇️ Download Francesinha Completa",
                     data=csv_francesinhas,
-                    file_name="francesinhas_consolidadas.csv",
+                    file_name="francesinha_completa.csv",
                     mime="text/csv"
                 )
-                
-                # Armazenar dados das francesinhas no session_state
-                st.session_state['df_francesinhas'] = df_francesinhas_final
-
-# Seção separada para gerar contabilidade
-st.markdown("---")
-st.subheader("📊 Gerar Arquivo Contabilidade")
-
-if 'df_francesinhas' in st.session_state and plano_contas is not None and conta_debito_banco:
-    if st.button("🔄 Gerar Contabilidade", type="primary"):
-        with st.spinner("Gerando arquivo contabilidade..."):
-            df_contabilidade = gerar_contabilidade(
-                st.session_state['df_francesinhas'], 
-                plano_contas, 
-                conta_debito_banco
-            )
-        
-        if df_contabilidade is not None and not df_contabilidade.empty:
-            st.success(f"✅ {len(df_contabilidade)} registros de contabilidade gerados")
-            st.dataframe(df_contabilidade.head(), use_container_width=True)
-            
-            csv_contabilidade = converter_para_csv(df_contabilidade)
-            st.download_button(
-                label="⬇️ Download CSV Contabilidade",
-                data=csv_contabilidade,
-                file_name="contabilidade.csv",
-                mime="text/csv"
-            )
-        else:
-            st.warning("Nenhum registro de contabilidade foi gerado. Verifique se o plano de contas está correto.")
-
-elif 'df_francesinhas' not in st.session_state:
-    st.info("💡 Primeiro processe as francesinhas XLS para gerar a contabilidade.")
-elif plano_contas is None:
-    st.info("💡 Envie o plano de contas (CSV) para gerar a contabilidade.")
-elif not conta_debito_banco:
-    st.info("💡 Preencha a 'CONTA DÉBITO BANCO' para gerar a contabilidade.")
 
 # Rodapé
 st.markdown("---")
