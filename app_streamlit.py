@@ -10,9 +10,32 @@ import os
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 import sqlalchemy
+import spacy
 
 # Carregar variáveis de ambiente do arquivo .env
 load_dotenv()
+
+# --- Carregamento de Modelos e Recursos com Cache ---
+@st.cache_resource
+def carregar_modelo_spacy():
+    """Carrega o modelo spaCy para português e o coloca em cache."""
+    try:
+        return spacy.load('pt_core_news_sm')
+    except OSError:
+        st.error("Modelo 'pt_core_news_sm' não encontrado. Por favor, execute 'python -m spacy download pt_core_news_sm' no seu terminal.")
+        return None
+
+nlp = carregar_modelo_spacy()
+COMPANY_SUFFIXES = [
+    'LTDA', 'S/A', 'SA', 'ME', 'EIRELI', 'CIA', 'MEI', 'EPP', 'EIRELE', 'S.A', 
+    'ASSOCIACAO', 'SEGURANCA', 'AUTOMACAO', 'ROBOTICA', 'TECNOLOGIA', 
+    'SOLUCOES', 'COMERCIO', 'FERRAMENTAS', 'CFC', 'CORRESPONDENTE', 
+    'PET SERVICE', 'ORGANIZACAO', 'INSTALACOES', 'TREINAMENTOS', 
+    'GREMIO', 'IGREJA', 'INDUSTRIA', 'SINDICATO', 'CONSTRUTORA', 'SOFTWARE', 
+    'MOTORES', 'ARMAZENAGEM', 'CONTABEIS', 'ACO', 'EQUIPAMENTOS', 
+    'EXPRESS', 'TRANSPORTES'
+]
+
 
 # --- Conexão com o Banco de Dados (PostgreSQL) ---
 def init_connection():
@@ -32,7 +55,8 @@ def init_connection():
 
 engine = init_connection()
 
-# --- Funções do Banco de Dados ---
+# --- Funções do Banco de Dados (ANTIGAS E NOVAS) ---
+
 def get_empresas():
     """Busca todas as empresas cadastradas no banco de dados"""
     try:
@@ -63,40 +87,99 @@ def atualizar_empresa_ativa():
         map_empresas = {empresa['nome']: empresa for empresa in lista_empresas}
         st.session_state['empresa_ativa'] = map_empresas[empresa_selecionada_nome]
 
-# --- Funções de Persistência de Dados ---
+# --- Novas Funções de Persistência (Estrutura V2) ---
 
-def salvar_transacoes(df_transacoes, empresa_id):
-    """Salva um DataFrame de transações no banco de dados, evitando duplicatas."""
-    if df_transacoes.empty or empresa_id is None:
-        return 0, 0
+def salvar_dados_importados(df, tipo_arquivo, empresa_id, total_arquivos):
+    """Cria um registro de importação e salva os dados brutos processados (OFX ou Francesinha)."""
+    if df.empty or empresa_id is None:
+        return 0
+    
+    tabela_destino = 'transacoes_ofx' if tipo_arquivo == 'OFX' else 'francesinhas'
 
     with engine.connect() as conn:
-        # Renomear colunas do DataFrame para corresponder à tabela
-        df_db = df_transacoes.rename(columns={'id': 'id_transacao_ofx'})
-        df_db['empresa_id'] = empresa_id
-
-        # Buscar IDs de transação já existentes para a empresa
-        query_existentes = text("SELECT id_transacao_ofx FROM transacoes WHERE empresa_id = :empresa_id")
-        existentes = pd.read_sql(query_existentes, conn, params={"empresa_id": empresa_id})
-        
-        # Filtrar transações que ainda não estão no banco
-        df_novas = df_db[~df_db['id_transacao_ofx'].isin(existentes['id_transacao_ofx'])]
-
-        if df_novas.empty:
-            return 0, len(existentes)
-
-        # Salvar novas transações
+        # A verificação de duplicatas foi removida do código.
+        # A nova abordagem permite salvar todas as linhas do arquivo, mesmo que tenham IDs de transação repetidos.
+        # A unicidade de cada linha é garantida pela chave primária da tabela.
+        trans = conn.begin()
         try:
-            df_novas.to_sql('transacoes', conn, if_exists='append', index=False, dtype={
-                'data': sqlalchemy.types.TIMESTAMP,
-                'valor': sqlalchemy.types.Numeric,
+            # 1. Cria o registro na tabela de importações
+            query_importacao = text(
+                "INSERT INTO importacoes (empresa_id, tipo_arquivo, total_arquivos) VALUES (:empresa_id, :tipo_arquivo, :total_arquivos) RETURNING id"
+            )
+            result = conn.execute(query_importacao, {
+                "empresa_id": empresa_id, "tipo_arquivo": tipo_arquivo, "total_arquivos": total_arquivos
             })
-            conn.commit()
-            return len(df_novas), len(existentes)
+            importacao_id = result.scalar_one()
+
+            # 2. Prepara e salva o DataFrame
+            df_db = df.copy()
+            
+            # --- FIX PARA FRANCESINHA: Padroniza colunas para minúsculas ---
+            if tipo_arquivo == 'Francesinha':
+                df_db.columns = df_db.columns.str.lower()
+                # FIX: Converte colunas de data de string (DD/MM/YYYY) para datetime antes de salvar.
+                date_columns = ['dt_previsao_credito', 'vencimento', 'dt_limite_pgto', 'dt_liquid']
+                for col in date_columns:
+                    if col in df_db.columns:
+                        # errors='coerce' transforma datas inválidas ou vazias em Nulo (NaT) no banco.
+                        df_db[col] = pd.to_datetime(df_db[col], format='%d/%m/%Y', errors='coerce')
+
+            df_db['importacao_id'] = importacao_id
+            df_db['empresa_id'] = empresa_id
+            
+            # Renomeia colunas se necessário (para OFX, já foi feito acima)
+            if tipo_arquivo == 'OFX':
+                if 'id' in df_db.columns: # Renomeia apenas se ainda não foi feito
+                    df_db = df_db.rename(columns={'id': 'id_transacao_ofx'})
+            
+            # Garante que apenas colunas existentes na tabela sejam enviadas
+            colunas_da_tabela = [c.name for c in sqlalchemy.Table(tabela_destino, sqlalchemy.MetaData(), autoload_with=conn).columns]
+            colunas_para_manter = [col for col in df_db.columns if col in colunas_da_tabela]
+            df_db_final = df_db[colunas_para_manter]
+
+            df_db_final.to_sql(tabela_destino, conn, if_exists='append', index=False)
+            
+            trans.commit()
+            return len(df_db_final)
         except Exception as e:
-            st.error(f"Erro ao salvar transações: {e}")
-            conn.rollback()
-            return 0, len(existentes)
+            trans.rollback()
+            st.error(f"Erro ao salvar dados de {tipo_arquivo}: {e}")
+            return 0
+
+def salvar_conciliacao_final(df_conciliacao, empresa_id):
+    """Cria um registro de conciliação e salva os lançamentos finais."""
+    if df_conciliacao.empty or empresa_id is None:
+        return 0
+
+    with engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            # 1. Cria o registro na tabela de conciliações
+            query_conciliacao = text(
+                "INSERT INTO conciliacoes (empresa_id, total_lancamentos) VALUES (:empresa_id, :total_lancamentos) RETURNING id"
+            )
+            result = conn.execute(query_conciliacao, {
+                "empresa_id": empresa_id, "total_lancamentos": len(df_conciliacao)
+            })
+            conciliacao_id = result.scalar_one()
+            
+            # 2. Prepara e salva o DataFrame de lançamentos
+            df_db = df_conciliacao.drop(columns=['selecionar'])
+            df_db['conciliacao_id'] = conciliacao_id
+            df_db['empresa_id'] = empresa_id
+            
+            # Converte a data de string para objeto date
+            df_db['data'] = pd.to_datetime(df_db['data'], format='%d/%m/%Y').dt.date
+
+            df_db.to_sql('lancamentos_conciliacao', conn, if_exists='append', index=False)
+            
+            trans.commit()
+            return len(df_db)
+        except Exception as e:
+            trans.rollback()
+            st.error(f"Erro ao salvar conciliação final: {e}")
+            return 0
+
 
 def carregar_dados_historicos(empresa_id, tabela):
     """Carrega dados históricos de uma tabela para a empresa ativa."""
@@ -208,6 +291,73 @@ def criar_complemento_com_prefixo(row):
     complemento_base = f"{memo_str} | {payee_str}" if payee_str else memo_str
     
     return prefixo + complemento_base
+
+# --- Nova Função de Classificação de Sacado ---
+def classificar_sacado(sacado):
+    """Usa spaCy e heurísticas para classificar um nome como Pessoa Física (PF) ou Jurídica (PJ)."""
+    if not nlp or not sacado:
+        return 'Indefinido'
+    
+    # Heurística 1: Verifica siglas de empresa
+    if any(suffix in sacado.upper() for suffix in COMPANY_SUFFIXES):
+        return 'PJ'
+
+    # Análise com spaCy
+    doc = nlp(sacado)
+    for ent in doc.ents:
+        if ent.label_ == 'ORG': # Organização
+            return 'PJ'
+        if ent.label_ == 'PER': # Pessoa
+            return 'PF'
+            
+    # Heurística 2: Se não achou entidade, verifica se tem poucas palavras (provável PF)
+    if len(sacado.split()) <= 4:
+        return 'PF'
+    
+    return 'Indefinido' # Fallback
+
+def classificar_sacado_batch(conn, sacados_unicos):
+    """Classifica um batch de sacados usando o BD, heurísticas e spaCy como fallback."""
+    classificacoes = get_classificacoes_conhecidas(conn, sacados_unicos)
+    sacados_novos = [s for s in sacados_unicos if s not in classificacoes and pd.notna(s)]
+    
+    if nlp and sacados_novos:
+        for sacado_str in sacados_novos:
+            if not sacado_str or not isinstance(sacado_str, str):
+                continue
+
+            sacado_upper = sacado_str.upper()
+            
+            # Regra 1: Palavras-chave de alta confiança para PJ
+            if any(suffix in sacado_upper for suffix in COMPANY_SUFFIXES):
+                classificacoes[sacado_str] = 'PJ'
+                continue
+            
+            doc = nlp(sacado_str)
+            
+            # Regra 2: Entidades nomeadas de alta confiança
+            is_per = any(ent.label_ == 'PER' for ent in doc.ents)
+            is_org = any(ent.label_ == 'ORG' for ent in doc.ents)
+            
+            if is_per and not is_org:  # Se for apenas pessoa, é PF
+                classificacoes[sacado_str] = 'PF'
+                continue
+            
+            if is_org and not is_per:  # Se for apenas organização, é PJ
+                classificacoes[sacado_str] = 'PJ'
+                continue
+
+            # Regra 3: Heurísticas para casos ambíguos
+            # Nomes totalmente em maiúsculas (exceto nomes simples/curtos) são provavelmente PJ
+            if sacado_str.isupper() and len(sacado_str.split()) > 1:
+                classificacoes[sacado_str] = 'PJ'
+                continue
+
+            # Fallback final: Na dúvida, assume PJ, que é mais comum em transações de boleto.
+            # Isso corrige casos como 'DOHLER' que não são pegos pelas outras regras.
+            classificacoes[sacado_str] = 'PJ'
+            
+    return classificacoes
 
 # --- Interface da Sidebar ---
 with st.sidebar:
@@ -455,11 +605,10 @@ with tab_processamento:
 
             st.dataframe(df_para_mostrar, use_container_width=True, height=300)
             
-            # Botão de download usa os dados completos do session_state
-            csv_extratos = converter_para_csv(df_extratos_final)
-            
-            col_btn1, col_btn2 = st.columns(2)
-            with col_btn1:
+            # --- Botões de Ação para OFX ---
+            col_down_ofx, col_save_ofx = st.columns(2)
+            with col_down_ofx:
+                csv_extratos = converter_para_csv(df_extratos_final)
                 st.download_button(
                     label="⬇️ Download CSV (Todos os Arquivos)",
                     data=csv_extratos,
@@ -468,13 +617,16 @@ with tab_processamento:
                     key='download_ofx_csv',
                     use_container_width=True
                 )
-            with col_btn2:
-                if st.button("💾 Salvar no Banco de Dados", use_container_width=True):
+            
+            with col_save_ofx:
+                if st.button("💾 Salvar Extratos OFX no Banco de Dados", use_container_width=True):
                     empresa_id = st.session_state.get('empresa_ativa', {}).get('id')
                     if empresa_id:
-                        with st.spinner("Salvando transações..."):
-                            novas, existentes = salvar_transacoes(df_extratos_final, empresa_id)
-                            st.success(f"💾 Dados salvos! {novas} novas transações adicionadas. {existentes} já existiam.")
+                        with st.spinner("Salvando transações OFX..."):
+                            registros_salvos = salvar_dados_importados(
+                                df_extratos_final, 'OFX', empresa_id, len(arquivos_ofx)
+                            )
+                            st.success(f"💾 Dados salvos! {registros_salvos} transações OFX registradas.")
                     else:
                         st.warning("Nenhuma empresa selecionada para salvar os dados.")
 
@@ -547,6 +699,18 @@ with tab_processamento:
                 st.markdown("#### Visualização dos Dados da Francesinha")
                 st.dataframe(df_francesinhas_final, use_container_width=True, height=300)
                 
+                # Botão para Salvar no Banco de Dados
+                if st.button("💾 Salvar Francesinhas no Banco de Dados", use_container_width=True):
+                    empresa_id = st.session_state.get('empresa_ativa', {}).get('id')
+                    if empresa_id:
+                        with st.spinner("Salvando dados da francesinha..."):
+                            registros_salvos = salvar_dados_importados(
+                                df_francesinhas_final, 'Francesinha', empresa_id, len(arquivos_xls)
+                            )
+                            st.success(f"💾 Dados salvos! {registros_salvos} registros de francesinha salvos.")
+                    else:
+                        st.warning("Nenhuma empresa selecionada para salvar os dados.")
+                
                 csv_francesinhas = converter_para_csv(df_francesinhas_final)
                 st.download_button(
                     label="⬇️ Download Francesinha Completa",
@@ -565,95 +729,167 @@ with tab_processamento:
     if 'df_extratos_final' in st.session_state and 'df_francesinhas_final' in st.session_state:
         if st.button("Iniciar Conciliação", type="primary"):
             df_extratos = st.session_state['df_extratos_final']
+            df_francesinhas = st.session_state['df_francesinhas_final']
 
-            # FILTRO: Remove registros de "CRÉD.LIQUIDAÇÃO COBRANÇA" antes de processar.
-            # A filtragem é feita no dataframe de extratos original para garantir que a lógica
-            # seja aplicada corretamente antes da criação do campo 'complemento'.
-            df_extratos_filtrado = df_extratos[df_extratos['memo'] != 'CRÉD.LIQUIDAÇÃO COBRANÇA'].copy()
+            # 1. Separa os dados de liquidação do OFX
+            df_liquidacoes_ofx = df_extratos[df_extratos['memo'] == 'CRÉD.LIQUIDAÇÃO COBRANÇA'].copy()
             
-            # Criar o DataFrame de conciliação a partir dos dados filtrados
-            df_conciliacao = pd.DataFrame()
-            
-            # Preencher com dados do OFX
-            df_conciliacao['débito'] = df_extratos_filtrado.apply(calcular_debito, axis=1)
-            df_conciliacao['crédito'] = df_extratos_filtrado.apply(calcular_credito, axis=1)
-            df_conciliacao['histórico'] = df_extratos_filtrado.apply(calcular_historico, axis=1)
-            # Converter a data para o formato DD/MM/AAAA
-            df_conciliacao['data'] = pd.to_datetime(df_extratos_filtrado['data']).dt.strftime('%d/%m/%Y')
-            # Formata o valor como string com vírgula e duas casas decimais
-            df_conciliacao['valor'] = df_extratos_filtrado['valor'].abs().apply(lambda x: f"{x:.2f}".replace('.', ','))
-            # Adicionar coluna de origem
-            df_conciliacao['origem'] = df_extratos_filtrado['arquivo_origem']
-            # Unir 'memo' e 'payee' para o campo 'complemento' com prefixo
-            df_conciliacao['complemento'] = df_extratos_filtrado.apply(criar_complemento_com_prefixo, axis=1)
+            # 2. Filtra o OFX para remover as liquidações que serão substituídas
+            df_ofx_processado = df_extratos[df_extratos['memo'] != 'CRÉD.LIQUIDAÇÃO COBRANÇA'].copy()
+            conciliacao_ofx = pd.DataFrame()
+            conciliacao_ofx['débito'] = df_ofx_processado.apply(calcular_debito, axis=1)
+            conciliacao_ofx['crédito'] = df_ofx_processado.apply(calcular_credito, axis=1)
+            conciliacao_ofx['histórico'] = df_ofx_processado.apply(calcular_historico, axis=1)
+            conciliacao_ofx['data'] = pd.to_datetime(df_ofx_processado['data']).dt.strftime('%d/%m/%Y')
+            conciliacao_ofx['valor'] = df_ofx_processado['valor'].abs().apply(lambda x: f"{x:.2f}".replace('.', ','))
+            conciliacao_ofx['complemento'] = df_ofx_processado.apply(criar_complemento_com_prefixo, axis=1)
+            conciliacao_ofx['origem'] = df_ofx_processado['arquivo_origem']
+
+            # 3. Processa a Francesinha
+            conciliacao_francesinha = pd.DataFrame()
+            if not df_francesinhas.empty:
+                # Classifica o Sacado
+                df_francesinhas['tipo_sacado'] = df_francesinhas['Sacado'].apply(classificar_sacado)
+
+                # Mapeia o valor da liquidação do OFX para a francesinha pela data
+                df_francesinhas['data_liquid_dt'] = pd.to_datetime(df_francesinhas['Dt_Liquid'], format='%d/%m/%Y', errors='coerce')
+                if not df_liquidacoes_ofx.empty:
+                    df_liquidacoes_ofx['data_dt'] = pd.to_datetime(df_liquidacoes_ofx['data']).dt.normalize()
+                    df_liquidacoes_ofx_agg = df_liquidacoes_ofx.groupby('data_dt')['valor'].sum().reset_index()
+                    df_francesinhas = pd.merge(df_francesinhas, df_liquidacoes_ofx_agg, left_on=df_francesinhas['data_liquid_dt'].dt.normalize(), right_on='data_dt', how='left').rename(columns={'valor': 'valor_liquidacao_total'})
+
+                conciliacao_francesinha['débito'] = ''
+                conciliacao_francesinha['crédito'] = df_francesinhas.apply(
+                    lambda row: '9999' if row['Arquivo_Origem'] == 'Juros de Mora' else ('10550' if row['tipo_sacado'] == 'PF' else '13709'),
+                    axis=1
+                )
+                conciliacao_francesinha['histórico'] = '' # TODO: Regra de histórico
+                conciliacao_francesinha['data'] = df_francesinhas['Dt_Liquid']
+                conciliacao_francesinha['valor'] = df_francesinhas['Valor_RS'].apply(lambda x: f"{x:.2f}".replace('.', ','))
+                
+                # Cria o complemento complexo
+                def criar_complemento_francesinha(row):
+                    valor_total = row.get('valor_liquidacao_total', 'N/A')
+                    valor_formatado = f"{valor_total:.2f}".replace('.', ',') if pd.notna(valor_total) else 'N/A'
+                    complemento_base = f"C - {row['Sacado']} | {valor_formatado} | CRÉD.LIQUIDAÇÃO COBRANÇA | {row['Dt_Liquid']}"
+                    # Adiciona o sufixo de Juros de Mora se a origem for correspondente
+                    if row['Arquivo_Origem'] == 'Juros de Mora':
+                        return f"{complemento_base} | Juros de Mora"
+                    return complemento_base
+
+                conciliacao_francesinha['complemento'] = df_francesinhas.apply(criar_complemento_francesinha, axis=1)
+                conciliacao_francesinha['origem'] = df_francesinhas['Arquivo_Origem']
+
+            # 4. Concatena os DataFrames
+            df_conciliacao = pd.concat([conciliacao_ofx, conciliacao_francesinha], ignore_index=True)
             
             # Armazenar resultado na sessão
             st.session_state['df_conciliacao'] = df_conciliacao
-            st.success("✅ Dataset de conciliação gerado! Registros de 'CRÉD.LIQUIDAÇÃO COBRANÇA' foram removidos.")
+            st.success("✅ Dataset de conciliação gerado! Lançamentos da Francesinha foram incluídos.")
 
     # Exibe a tabela de conciliação e o botão de download se os dados existirem
     if 'df_conciliacao' in st.session_state:
-        st.markdown("#### Visualização e Edição do Lançamento Padrão")
+        st.header("2. Revise e Edite sua Conciliação")
 
         # --- Filtro Universal e Seleção em Lote ---
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            filtro_universal = st.text_input(
-                "🔍 Filtrar em todas as colunas:", 
-                help="Digite para filtrar a tabela em tempo real."
-            )
+        col1_filtro, col2_selecao = st.columns([3, 1])
+        with col1_filtro:
+            filtro_universal = st.text_input("🔍 Filtrar em todas as colunas:", help="Digite para filtrar a tabela em tempo real.")
         
-        # DataFrame original da sessão
         df_original = st.session_state['df_conciliacao']
-
-        # Aplica o filtro universal
         if filtro_universal:
-            # Converte todas as colunas para string para uma busca segura
             df_str = df_original.astype(str).apply(lambda s: s.str.lower())
-            indices_filtrados = df_str[df_str.apply(
-                lambda row: row.str.contains(filtro_universal.lower(), na=False).any(), axis=1
-            )].index
-            df_para_mostrar = df_original.loc[indices_filtrados]
+            indices_filtrados = df_str[df_str.apply(lambda row: row.str.contains(filtro_universal.lower(), na=False).any(), axis=1)].index
         else:
-            df_para_mostrar = df_original
             indices_filtrados = df_original.index
 
-        with col2:
-            st.write("") # Spacer
+        with col2_selecao:
+            st.write("") # Spacer para alinhar verticalmente
             if st.button("Selecionar Todos os Filtrados", use_container_width=True):
-                # Marca 'selecionar' como True para os índices filtrados no DF original
+                if 'selecionar' not in st.session_state['df_conciliacao'].columns:
+                     st.session_state['df_conciliacao'].insert(0, 'selecionar', False)
                 st.session_state['df_conciliacao'].loc[indices_filtrados, 'selecionar'] = True
                 st.rerun()
 
-        # Adiciona a coluna de seleção se ela não existir
-        if 'selecionar' not in st.session_state['df_conciliacao'].columns:
-            st.session_state['df_conciliacao'].insert(0, 'selecionar', False)
 
-        # Garante a ordem correta das colunas
-        colunas_ordenadas = ['selecionar', 'débito', 'crédito', 'histórico', 'data', 'valor', 'complemento', 'origem']
-        df_para_mostrar = df_para_mostrar[colunas_ordenadas]
+        # --- Ferramenta de Refinamento com Lista de Clientes ---
+        with st.expander("Ferramenta de Produtividade: Refinar com Lista de Clientes PJ"):
+            st.info("Se a classificação automática de PJ/PF cometeu muitos erros, você pode corrigi-los em massa subindo uma lista com os nomes dos seus clientes PJ conhecidos (um por linha).")
+            
+            uploaded_clientes_pj = st.file_uploader(
+                "Subir lista de clientes PJ (.csv ou .txt)",
+                type=['csv', 'txt'],
+                key='clientes_pj_uploader'
+            )
 
-        # --- Tabela Editável ---
+            if uploaded_clientes_pj:
+                if st.button("🚀 Aplicar Lista de Clientes e Reclassificar"):
+                    # Lê a lista de clientes PJ do arquivo
+                    try:
+                        nomes_clientes_pj = pd.read_csv(uploaded_clientes_pj, header=None, squeeze=True).str.strip().str.upper().tolist()
+                    except Exception:
+                         # Se for txt ou outro formato, lê linha por linha
+                        uploaded_clientes_pj.seek(0)
+                        nomes_clientes_pj = [line.decode('utf-8').strip().upper() for line in uploaded_clientes_pj.readlines()]
+
+                    # Pega o dataframe da sessão
+                    df_atual = st.session_state['df_conciliacao']
+                    
+                    # Extrai o sacado do complemento para poder comparar
+                    df_atual['sacado_temp'] = df_atual['complemento'].str.split('|').str[0].str.replace('C -', '').str.strip().str.upper()
+
+                    # Aplica a reclassificação
+                    def reclassificar_credito(row):
+                        # Juros de Mora é prioridade máxima
+                        if row['origem'] == 'Juros de Mora':
+                            return '9999'
+                        
+                        # Se o sacado estiver na lista de PJ, é 13709
+                        if row['sacado_temp'] in nomes_clientes_pj:
+                            return '13709'
+                        
+                        # Se não, mantém a classificação original (que veio da IA ou do banco)
+                        # mas precisamos recalcular para garantir a consistência
+                        # (Neste exemplo, apenas retornamos o valor antigo se não estiver na lista)
+                        # Uma implementação mais robusta poderia re-chamar a IA aqui se necessário.
+                        return row['crédito']
+
+                    df_atual['crédito'] = df_atual.apply(reclassificar_credito, axis=1)
+
+                    # Remove a coluna temporária
+                    df_atual.drop(columns=['sacado_temp'], inplace=True)
+
+                    st.session_state['df_conciliacao'] = df_atual
+                    st.success("✅ Classificação refinada com sucesso usando a lista de clientes!")
+                    st.rerun()
+
+        
+        # Editor de dados
+        st.info("💡 Clique nas células para editar. As alterações são salvas automaticamente nesta visualização.")
+        
+        # Prepara o DF para o editor, mostrando apenas os filtrados
+        df_para_mostrar = df_original.loc[indices_filtrados]
+        
         edited_df = st.data_editor(
             df_para_mostrar,
+            key='data_editor',
             use_container_width=True,
             hide_index=True,
             height=400,
             column_config={
-                "selecionar": st.column_config.CheckboxColumn(required=True),
-                "débito": st.column_config.TextColumn(disabled=True),
-                "crédito": st.column_config.TextColumn(disabled=True),
-                "histórico": st.column_config.TextColumn(disabled=True),
-                "data": st.column_config.TextColumn(disabled=True),
+                "débito": st.column_config.TextColumn(),
+                "crédito": st.column_config.TextColumn(),
+                "histórico": st.column_config.TextColumn(),
+                "data": st.column_config.TextColumn(),
                 "valor": st.column_config.TextColumn(disabled=True),
                 "complemento": st.column_config.TextColumn(disabled=True),
                 "origem": st.column_config.TextColumn(disabled=True),
             },
-            key='editor_conciliacao'
         )
 
-        # Atualiza o DF original na sessão com as seleções feitas no editor
-        st.session_state['df_conciliacao'].update(edited_df)
+        # Atualiza o DataFrame na sessão com as edições feitas pelo usuário
+        if 'df_conciliacao' in st.session_state:
+            st.session_state['df_conciliacao'].update(edited_df)
 
         # --- Lógica de Edição em Lote ---
         st.markdown("---")
@@ -709,15 +945,28 @@ with tab_processamento:
 
         st.markdown("---")
         df_para_download = st.session_state['df_conciliacao'].drop(columns=['selecionar'])
-        csv_conciliacao = converter_para_csv(df_para_download)
         
-        st.download_button(
-            label="⬇️ Download CSV de Conciliação",
-            data=csv_conciliacao,
-            file_name="conciliacao_contabil.csv",
-            mime="text/csv",
-            key='download_conciliacao_csv'
-        )
+        col_down, col_save = st.columns(2)
+        with col_down:
+            csv_conciliacao = converter_para_csv(df_para_download)
+            st.download_button(
+                label="⬇️ Download CSV de Conciliação",
+                data=csv_conciliacao,
+                file_name="conciliacao_contabil.csv",
+                mime="text/csv",
+                key='download_conciliacao_csv',
+                use_container_width=True
+            )
+        with col_save:
+            if st.button("💾 Salvar Conciliação Final no DB", type="primary", use_container_width=True):
+                empresa_id = st.session_state.get('empresa_ativa', {}).get('id')
+                if empresa_id:
+                    with st.spinner("Salvando conciliação final..."):
+                        registros_salvos = salvar_conciliacao_final(df_para_download, empresa_id)
+                        st.success(f"💾 Conciliação salva! {registros_salvos} lançamentos registrados no banco de dados.")
+                else:
+                    st.warning("Nenhuma empresa selecionada para salvar a conciliação.")
+
     elif 'df_extratos_final' in st.session_state and 'df_francesinhas_final' in st.session_state:
         st.info("Clique no botão 'Iniciar Conciliação' para gerar o arquivo.")
     else:
