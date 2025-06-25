@@ -1,3 +1,6 @@
+# Para o modelo spaCy em português, execute:
+# python -m spacy download pt_core_news_sm
+
 altair==5.5.0
 annotated-types==0.7.0
 attrs==25.3.0
