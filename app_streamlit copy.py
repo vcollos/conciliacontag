@@ -164,7 +164,10 @@ def salvar_conciliacao_final(df_conciliacao, empresa_id):
             conciliacao_id = result.scalar_one()
             
             # 2. Prepara e salva o DataFrame de lançamentos
-            df_db = df_conciliacao.drop(columns=['selecionar'])
+            df_db = df_conciliacao.copy()
+            if 'selecionar' in df_db.columns:
+                df_db.drop(columns=['selecionar'], inplace=True)
+
             df_db['conciliacao_id'] = conciliacao_id
             df_db['empresa_id'] = empresa_id
             
@@ -783,6 +786,10 @@ with tab_processamento:
             # 4. Concatena os DataFrames
             df_conciliacao = pd.concat([conciliacao_ofx, conciliacao_francesinha], ignore_index=True)
             
+            # GARANTE que a coluna 'selecionar' para edição em lote exista desde o início.
+            if 'selecionar' not in df_conciliacao.columns:
+                df_conciliacao.insert(0, 'selecionar', False)
+
             # Armazenar resultado na sessão
             st.session_state['df_conciliacao'] = df_conciliacao
             st.success("✅ Dataset de conciliação gerado! Lançamentos da Francesinha foram incluídos.")
