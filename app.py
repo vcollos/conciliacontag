@@ -268,9 +268,9 @@ def criar_chave_regra(row):
     complemento = str(row.get('complemento', ''))
     origem = str(row.get('origem', '')).lower()
     
-    # Regra para Juros de Mora é fixa, não precisa de chave de aprendizado
+    # Para Juros de Mora: usa o texto antes do primeiro pipe
     if 'juros de mora' in origem:
-        return None
+        return complemento.split('|')[0].strip()
 
     # Regra para Francesinha: usa o texto antes do primeiro pipe
     if 'francesinha' in origem:
