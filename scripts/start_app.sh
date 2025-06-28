@@ -26,4 +26,4 @@ echo "Instalando dependências..."
 pip install -r requirements.txt
 
 # Inicia a aplicação
-/home/collos/apps/conciliacontag/venv/bin/streamlit run app.py --server.port=8404 --server.address=0.0.0.0 
+/home/collos/apps/conciliacontag/venv/bin/streamlit run src/core/app.py --server.port=8404 --server.address=0.0.0.0 
