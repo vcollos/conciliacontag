@@ -814,7 +814,6 @@ with tab_processamento:
                     st.warning(f"Atenção: Os arquivos a seguir já existem e serão sobrescritos: **{', '.join(arquivos_existentes)}**")
                     if st.button("Confirmar e Sobrescrever OFX", use_container_width=True, type="primary"):
                         st.session_state.ofx_overwrite_confirmed = True
-                        st.rerun()
                 else:
                     if st.button("💾 Salvar Extratos OFX no Banco de Dados", use_container_width=True):
                         if empresa_id and df_extratos_final is not None:
@@ -924,7 +923,6 @@ with tab_processamento:
                         st.warning(f"Atenção: Os arquivos a seguir já existem e serão sobrescritos: **{', '.join(arquivos_existentes_fran)}**")
                         if st.button("Confirmar e Sobrescrever Francesinha", use_container_width=True, type="primary"):
                             st.session_state.fran_overwrite_confirmed = True
-                            st.rerun()
                     else:
                         if st.button("💾 Salvar Francesinhas no Banco de Dados", use_container_width=True):
                             if empresa_id:
@@ -943,11 +941,11 @@ with tab_processamento:
     st.markdown("---")
     st.subheader("🚀 Conciliação Contábil")
 
-    # O botão de conciliação só aparece se ambos os dataframes estiverem na sessão
-    if 'df_extratos_final' in st.session_state and 'df_francesinhas_final' in st.session_state:
+    # O botão de conciliação aparece se houver OFX (com ou sem Francesinha)
+    if 'df_extratos_final' in st.session_state:
         if st.button("Iniciar Conciliação", type="primary"):
             df_extratos = st.session_state['df_extratos_final']
-            df_francesinhas = st.session_state['df_francesinhas_final']
+            df_francesinhas = st.session_state.get('df_francesinhas_final', pd.DataFrame())
 
             # 1. Separa os dados de liquidação do OFX
             df_liquidacoes_ofx = df_extratos[df_extratos['memo'] == 'CRÉD.LIQUIDAÇÃO COBRANÇA'].copy()
@@ -992,7 +990,9 @@ with tab_processamento:
                 def criar_complemento_francesinha(row):
                     valor_total = row.get('valor_liquidacao_total', 'N/A')
                     valor_formatado = f"{valor_total:.2f}".replace('.', ',') if pd.notna(valor_total) else 'N/A'
-                    complemento_base = f"C - {row['Sacado']} | {valor_formatado} | CRÉD.LIQUIDAÇÃO COBRANÇA | {row['Dt_Liquid']}"
+                    # Limita o nome do Sacado a 40 caracteres
+                    sacado_limitado = str(row['Sacado'])[:40].strip()
+                    complemento_base = f"C - {sacado_limitado} | {valor_formatado} | CRÉD.LIQUIDAÇÃO COBRANÇA | {row['Dt_Liquid']}"
                     # Adiciona o sufixo de Juros de Mora se a origem for correspondente
                     if row['Arquivo_Origem'] == 'Juros de Mora':
                         return f"{complemento_base} | Juros de Mora"
@@ -1038,7 +1038,12 @@ with tab_processamento:
             st.session_state['df_conciliacao'] = df_conciliacao
             st.success("✅ Dataset de conciliação gerado!")
 
-    # Exibe a tabela de conciliação e o botão de download se os dados existirem
+    elif 'df_francesinhas_final' in st.session_state and 'df_extratos_final' not in st.session_state:
+        st.warning("É necessário processar o arquivo OFX para habilitar a conciliação.")
+    else:
+        st.warning("É necessário processar os arquivos OFX e de Francesinha para habilitar a conciliação.")
+
+    # Exibe a tabela de conciliação e o editor se o dataset existir
     if 'df_conciliacao' in st.session_state:
         st.header("2. Revise e Edite sua Conciliação")
 
@@ -1072,10 +1077,8 @@ with tab_processamento:
             if st.button(botao_label, use_container_width=True):
                 novo_valor = not todos_filtrados_selecionados
                 st.session_state['df_conciliacao'].loc[indices_filtrados, 'selecionar'] = novo_valor
-                st.rerun()
 
-
-        # --- Ferramenta de Refinamento com Lista de Clientes ---
+        # --- Ferramenta de Refinamento com Lista de Clientes PJ ---
         with st.expander("Ferramenta de Produtividade: Refinar com Lista de Clientes PJ"):
             st.info("Se a classificação automática de PJ/PF cometeu muitos erros, você pode corrigi-los em massa subindo uma lista com os nomes dos seus clientes PJ conhecidos (um por linha).")
             
@@ -1098,33 +1101,26 @@ with tab_processamento:
                     # Pega o dataframe da sessão
                     df_atual = st.session_state['df_conciliacao']
                     
-                    # Extrai o sacado do complemento para poder comparar
-                    df_atual['sacado_temp'] = df_atual['complemento'].str.split('|').str[0].str.replace('C -', '').str.strip().str.upper()
+                    # Extrai o sacado do complemento para poder comparar (limita a 40 caracteres)
+                    df_atual['sacado_temp'] = df_atual['complemento'].str.split('|').str[0].str.replace('C -', '').str.strip().str.upper().str[:40]
+
+                    # Limita todos os nomes da lista de clientes PJ a 40 caracteres
+                    nomes_clientes_pj_limitados = [nome[:40] for nome in nomes_clientes_pj]
 
                     # Define as condições para aplicar as regras
-                    # Condição 1: A origem DEVE conter 'francesinha' (case-insensitive) para ser reclassificada
                     condicao_francesinha = df_atual['origem'].str.contains('francesinha', case=False, na=False)
-                    # Condição 2: O sacado está na lista de clientes PJ
-                    condicao_pj = df_atual['sacado_temp'].isin(nomes_clientes_pj)
+                    condicao_pj = df_atual['sacado_temp'].isin(nomes_clientes_pj_limitados)
                     
-                    # Aplica a regra para clientes PJ que são da francesinha
                     indices_pj = df_atual[condicao_francesinha & condicao_pj].index
                     df_atual.loc[indices_pj, 'crédito'] = '13709'
                     df_atual.loc[indices_pj, 'histórico'] = '78'
-                    
-                    # Aplica a regra para os restantes da francesinha que não são PJ
                     indices_outros = df_atual[condicao_francesinha & ~condicao_pj].index
                     df_atual.loc[indices_outros, 'crédito'] = '10550'
                     df_atual.loc[indices_outros, 'histórico'] = '78'
-
-                    # Remove a coluna temporária
                     df_atual.drop(columns=['sacado_temp'], inplace=True)
-
                     st.session_state['df_conciliacao'] = df_atual
                     st.success("✅ Classificação da francesinha aplicada com sucesso!")
-                    st.rerun()
 
-        
         # Editor de dados
         st.info("💡 Clique nas células para editar. As alterações são salvas automaticamente nesta visualização.")
         
@@ -1167,8 +1163,7 @@ with tab_processamento:
         elif not st.session_state.editing_enabled:
             if st.button("Habilitar Edição em Lote", type="secondary"):
                 st.session_state.editing_enabled = True
-                st.rerun()
-        
+
         if st.session_state.editing_enabled and not linhas_selecionadas.empty:
             st.success(f"{len(linhas_selecionadas)} linha(s) selecionada(s). Preencha os campos abaixo e clique em 'Aplicar'.")
             
@@ -1186,23 +1181,18 @@ with tab_processamento:
                 with col_btn1:
                     if st.button("Aplicar aos Selecionados", type="primary", use_container_width=True):
                         indices_para_atualizar = linhas_selecionadas.index
-                        
                         if novo_debito:
                             st.session_state['df_conciliacao'].loc[indices_para_atualizar, 'débito'] = novo_debito
                         if novo_credito:
                             st.session_state['df_conciliacao'].loc[indices_para_atualizar, 'crédito'] = novo_credito
                         if novo_historico:
                             st.session_state['df_conciliacao'].loc[indices_para_atualizar, 'histórico'] = novo_historico
-                        
                         st.session_state['df_conciliacao']['selecionar'] = False
                         st.session_state.editing_enabled = False
-                        
                         st.toast("Valores aplicados com sucesso!")
-                        st.rerun()
                 with col_btn2:
                     if st.button("Cancelar", use_container_width=True):
                         st.session_state.editing_enabled = False
-                        st.rerun()
 
         st.markdown("---")
         df_para_salvar = st.session_state['df_conciliacao'].drop(columns=['selecionar'])
@@ -1232,10 +1222,8 @@ with tab_processamento:
                         with st.spinner("Sobrescrevendo conciliação final..."):
                             registros_salvos = salvar_conciliacao_final(df_para_salvar, empresa_id, origens_para_sobrescrever=origens_existentes)
                             st.success(f"💾 Conciliação sobrescrita! {registros_salvos} lançamentos registrados.")
-                            st.rerun() # Apenas para limpar o estado de aviso após o sucesso
                     else:
                         st.warning("Nenhuma empresa selecionada para salvar a conciliação.")
-            
             # Se não existem, mostra o botão de salvar normal
             else:
                 if st.button("💾 Salvar Conciliação Final no DB", type="primary", use_container_width=True):
@@ -1243,15 +1231,9 @@ with tab_processamento:
                         with st.spinner("Salvando conciliação final..."):
                             registros_salvos = salvar_conciliacao_final(df_para_salvar, empresa_id)
                             st.success(f"💾 Conciliação salva! {registros_salvos} lançamentos registrados no banco de dados.")
-                            st.rerun() # Apenas para limpar o estado de aviso após o sucesso
+                            # st.rerun() removido
                     else:
                         st.warning("Nenhuma empresa selecionada para salvar a conciliação.")
-
-    elif 'df_extratos_final' in st.session_state and 'df_francesinhas_final' in st.session_state:
-        st.info("Clique no botão 'Iniciar Conciliação' para gerar o arquivo.")
-    else:
-        st.warning("É necessário processar os arquivos OFX e de Francesinha para habilitar a conciliação.")
-
 
 # --- Aba de Histórico de Dados ---
 with tab_historico:
