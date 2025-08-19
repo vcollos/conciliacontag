@@ -62,7 +62,7 @@ def get_empresas():
     """Busca todas as empresas cadastradas no banco de dados"""
     try:
         with engine.connect() as conn:
-            result = conn.execute(text("SELECT id, nome, razao_social, cnpj FROM empresas ORDER BY nome"))
+            result = conn.execute(text("SELECT id, nome, razao_social, cnpj FROM concilia.empresas ORDER BY nome"))
             return [dict(row._mapping) for row in result]
     except Exception as e:
         st.error(f"Erro ao buscar empresas: {e}")
@@ -72,7 +72,7 @@ def cadastrar_empresa(nome, razao_social, cnpj):
     """Cadastra uma nova empresa no banco de dados"""
     try:
         with engine.connect() as conn:
-            query = text("INSERT INTO empresas (nome, razao_social, cnpj) VALUES (:nome, :razao_social, :cnpj)")
+            query = text("INSERT INTO concilia.empresas (nome, razao_social, cnpj) VALUES (:nome, :razao_social, :cnpj)")
             conn.execute(query, {"nome": nome, "razao_social": razao_social, "cnpj": cnpj})
             conn.commit()
         return True
@@ -129,7 +129,7 @@ def verificar_conciliacao_existente(empresa_id, df):
 
     try:
         with engine.connect() as conn:
-            query = text("SELECT DISTINCT origem FROM lancamentos_conciliacao WHERE empresa_id = :empresa_id AND origem = ANY(:origens)")
+            query = text("SELECT DISTINCT origem FROM concilia.lancamentos_conciliacao WHERE empresa_id = :empresa_id AND origem = ANY(:origens)")
             result = conn.execute(query, {"empresa_id": empresa_id, "origens": arquivos_de_origem})
             return [row[0] for row in result]
     except Exception as e:
@@ -167,7 +167,7 @@ def salvar_dados_importados(df, tipo_arquivo, empresa_id, total_arquivos):
 
             # 1. Cria o registro na tabela de importações
             query_importacao = text(
-                "INSERT INTO importacoes (empresa_id, tipo_arquivo, total_arquivos) VALUES (:empresa_id, :tipo_arquivo, :total_arquivos) RETURNING id"
+                "INSERT INTO concilia.importacoes (empresa_id, tipo_arquivo, total_arquivos) VALUES (:empresa_id, :tipo_arquivo, :total_arquivos) RETURNING id"
             )
             result = conn.execute(query_importacao, {
                 "empresa_id": empresa_id, "tipo_arquivo": tipo_arquivo, "total_arquivos": total_arquivos
@@ -220,13 +220,13 @@ def salvar_conciliacao_final(df_conciliacao, empresa_id, origens_para_sobrescrev
         try:
             # ANTES DE TUDO: Deleta lançamentos existentes APENAS para os arquivos que devem ser sobrescritos
             if origens_para_sobrescrever:
-                delete_query = text("DELETE FROM lancamentos_conciliacao WHERE empresa_id = :empresa_id AND origem = ANY(:origens)")
+                delete_query = text("DELETE FROM concilia.lancamentos_conciliacao WHERE empresa_id = :empresa_id AND origem = ANY(:origens)")
                 conn.execute(delete_query, {"empresa_id": empresa_id, "origens": origens_para_sobrescrever})
 
             # 1. Cria o registro na tabela de conciliações
             # (Nota: O total de lançamentos pode não refletir o número de linhas novas, mas sim o total da apuração atual)
             query_conciliacao = text(
-                "INSERT INTO conciliacoes (empresa_id, total_lancamentos) VALUES (:empresa_id, :total_lancamentos) RETURNING id"
+                "INSERT INTO concilia.conciliacoes (empresa_id, total_lancamentos) VALUES (:empresa_id, :total_lancamentos) RETURNING id"
             )
             result = conn.execute(query_conciliacao, {
                 "empresa_id": empresa_id, "total_lancamentos": len(df_conciliacao)
@@ -318,7 +318,7 @@ def salvar_regras_conciliacao(conn, df_regras, empresa_id):
 
     # Prepara a query de UPSERT (INSERT ... ON CONFLICT)
     query = text("""
-        INSERT INTO regras_conciliacao (empresa_id, complemento_hash, complemento_texto, debito, credito, historico, last_used)
+        INSERT INTO concilia.regras_conciliacao (empresa_id, complemento_hash, complemento_texto, debito, credito, historico, last_used)
         VALUES (:empresa_id, :complemento_hash, :complemento, :debito, :credito, :historico, CURRENT_TIMESTAMP)
         ON CONFLICT (empresa_id, complemento_hash) DO UPDATE SET
             debito = EXCLUDED.debito,
@@ -351,7 +351,7 @@ def carregar_regras_conciliacao(empresa_id):
         with engine.connect() as conn:
             query = text("""
                 SELECT complemento_hash, debito, credito, historico 
-                FROM regras_conciliacao 
+                FROM concilia.regras_conciliacao 
                 WHERE empresa_id = :empresa_id
             """)
             result = conn.execute(query, {"empresa_id": empresa_id})

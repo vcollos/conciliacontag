@@ -7,65 +7,64 @@ load_dotenv()  # Carrega variáveis do arquivo .env se existir
 
 
 
-DB_USER = os.getenv("DB_USER", "collos")
-DB_PASS = os.getenv("DB_PASS", "soeusei22")
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "collosfiscal")
+# Choose which database to connect to by selecting the appropriate env variables
+DB_USER = os.getenv("SUPABASE_USER", os.getenv("DB_USER", "collos"))
+DB_PASS = os.getenv("SUPABASE_PASSWORD", os.getenv("DB_PASS", "soeusei22"))
+DB_HOST = os.getenv("SUPABASE_HOST", os.getenv("DB_HOST", "localhost"))
+DB_PORT = os.getenv("SUPABASE_PORT", os.getenv("DB_PORT", "5432"))
+DB_NAME = os.getenv("SUPABASE_DB_NAME", os.getenv("DB_NAME", "collosfiscal"))
 
 engine = create_engine(f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
 
 metadata = MetaData()
 
+# Ensure schema 'concilia' exists
+with engine.connect() as conn:
+    conn.execute("CREATE SCHEMA IF NOT EXISTS concilia")
+    conn.commit()
+
 # Definição explícita das tabelas
 
-empresas = Table(
-    "empresas",
-    metadata,
+empresas = Table('empresas', metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("cnpj", String(14), nullable=False, unique=True),
     Column("nome", String(255), nullable=False),
     Column("razao_social", String(255), nullable=False),
-    extend_existing=True
+    extend_existing=True,
+    schema='concilia'
 )
 
-origem_destino_cfop = Table(
-    "origem_destino_cfop",
-    metadata,
+origem_destino_cfop = Table('origem_destino_cfop', metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("origem", String, nullable=False),
     Column("destino", String, nullable=False),
     Column("cfop", String, nullable=False),
-    extend_existing=True
+    extend_existing=True,
+    schema='concilia'
 )
 
-tipo_operacao_cfop = Table(
-    "tipo_operacao_cfop",
-    metadata,
+tipo_operacao_cfop = Table('tipo_operacao_cfop', metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("descricao", String, nullable=False),
-    extend_existing=True
+    extend_existing=True,
+    schema='concilia'
 )
 
-finalidade_cfop = Table(
-    "finalidade_cfop",
-    metadata,
+finalidade_cfop = Table('finalidade_cfop', metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("descricao", String, nullable=False),
-    extend_existing=True
+    extend_existing=True,
+    schema='concilia'
 )
 
-emissores_operacoes = Table(
-    "emissores_operacoes",
-    metadata,
+emissores_operacoes = Table('emissores_operacoes', metadata,
     Column("cnpj_emissor", String(14), primary_key=True),
     Column("tipo_operacao", String(255), nullable=False),
-    extend_existing=True
+    extend_existing=True,
+    schema='concilia'
 )
 
-preferencias_fornecedor_empresa = Table(
-    "preferencias_fornecedor_empresa",
-    metadata,
+preferencias_fornecedor_empresa = Table('preferencias_fornecedor_empresa', metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("empresa_id", Integer, nullable=False),
     Column("cnpj_fornecedor", String(14), nullable=False),
@@ -76,10 +75,16 @@ preferencias_fornecedor_empresa = Table(
     Column("historico", String(9)),
     Column("data_nota", String),
     Column("complemento", String(255)),
-    extend_existing=True
+    extend_existing=True,
+    schema='concilia'
 )
 
-metadata.create_all(engine)
+print("Creating tables if they do not exist...")
+try:
+    metadata.create_all(engine)
+    print("Tables created successfully.")
+except Exception as e:
+    print(f"Error creating tables: {e}")
 
 # 📋 Funções para buscar interpretações
 

@@ -37,7 +37,7 @@ def cadastrar_empresa(cnpj, razao_social, nome_fantasia):
     from src.db import engine, Table, MetaData, insert
     metadata = MetaData()
     metadata.reflect(bind=engine)
-    empresas_table = Table('empresas', metadata, autoload_with=engine)
+    empresas_table = Table('empresas', metadata, schema='concilia', autoload_with=engine)
     with engine.connect() as conn:
         stmt = insert(empresas_table).values(cnpj=cnpj, nome=nome_fantasia, razao_social=razao_social)
         conn.execute(stmt)
@@ -48,7 +48,7 @@ if st.session_state.empresa_selecionada is None:
     from src.db import engine, Table, MetaData
     metadata = MetaData()
     metadata.reflect(bind=engine)
-    empresas_table = Table('empresas', metadata, autoload_with=engine)
+    empresas_table = Table('empresas', metadata, schema='concilia', autoload_with=engine)
     with engine.connect() as conn:
         result = conn.execute(empresas_table.select())
         empresas = result.fetchall()

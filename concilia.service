@@ -1,0 +1,16 @@
+[Unit]
+Description=Servio Sistema Concilia Contabil
+After=network.target
+
+[Service]
+Type=simple
+User=collos
+WorkingDirectory=/home/collos/apps/conciliacontag
+ExecStart=/bin/bash /home/collos/apps/conciliacontag/scripts/start_app.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
