@@ -7,6 +7,7 @@ from ofxparse import OfxParser
 import io
 import zipfile
 import os
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 import sqlalchemy
@@ -40,13 +41,41 @@ COMPANY_SUFFIXES = [
 
 # --- Conexão com o Banco de Dados (PostgreSQL) ---
 def init_connection():
-    """Inicializa a conexão com o banco de dados PostgreSQL"""
+    """Inicializa a conexão com o banco de dados PostgreSQL.
+
+    Sanitiza valores lidos do .env (remove aspas externas) e faz
+    URL-encoding do usuário/senha para evitar problemas com espaços
+    e caracteres especiais. Adiciona sslmode=require para conexões
+    com Supabase quando necessário.
+    """
     try:
-        db_url = (
-            f"postgresql+psycopg2://{os.getenv('SUPABASE_USER')}:"
-            f"{os.getenv('SUPABASE_PASSWORD')}@{os.getenv('SUPABASE_HOST')}:"
-            f"{os.getenv('SUPABASE_PORT')}/{os.getenv('SUPABASE_DB_NAME')}"
-        )
+        # Lê variáveis do ambiente com fallback para string vazia
+        raw_user = os.getenv('SUPABASE_USER', '') or ''
+        raw_password = os.getenv('SUPABASE_PASSWORD', '') or ''
+        raw_host = os.getenv('SUPABASE_HOST', '') or ''
+        raw_port = os.getenv('SUPABASE_PORT', '') or ''
+        raw_db = os.getenv('SUPABASE_DB_NAME', '') or ''
+
+        # Remove aspas externas simples ou duplas se houver
+        def _strip_quotes(s: str) -> str:
+            s = s.strip()
+            if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+                return s[1:-1]
+            return s
+
+        user = _strip_quotes(raw_user)
+        password = _strip_quotes(raw_password)
+        host = _strip_quotes(raw_host)
+        port = _strip_quotes(raw_port)
+        dbname = _strip_quotes(raw_db)
+
+        # Faz URL-encoding de user e password para evitar erros com espaços e chars especiais
+        user_enc = quote_plus(user)
+        password_enc = quote_plus(password)
+
+        # Monta a URL de conexão e força sslmode=require (compatível com Supabase)
+        db_url = f"postgresql+psycopg2://{user_enc}:{password_enc}@{host}:{port}/{dbname}?sslmode=require"
+
         engine = create_engine(db_url)
         return engine
     except Exception as e:
@@ -601,6 +630,38 @@ st.set_page_config(
     page_title="Processador de Extratos",
     page_icon="💰",
     layout="wide"
+)
+
+# Proteção contra redefinição de Custom Elements (ex.: mce-autosize-textarea)
+# Injeta um pequeno script no DOM que previne erro caso um elemento customizado
+# seja definido mais de uma vez. Isso evita o erro:
+# "A custom element with name 'mce-autosize-textarea' has already been defined."
+# Colocado no início da página para rodar antes de componentes de terceiros.
+import streamlit.components.v1 as components
+components.html(
+    """
+    <script>
+    (function(){
+        try {
+            const origDefine = window.customElements && window.customElements.define;
+            if (origDefine) {
+                window.customElements.define = function(name, constructor, options) {
+                    try {
+                        if (window.customElements.get(name)) return;
+                        return origDefine.call(this, name, constructor, options);
+                    } catch (e) {
+                        // Silencia erros inesperados e registra um aviso no console.
+                        console.warn('customElements.define skipped or failed for', name, e);
+                    }
+                };
+            }
+        } catch (e) {
+            console.warn('Failed to patch customElements.define', e);
+        }
+    })();
+    </script>
+    """,
+    height=0,
 )
 
 # Exibir empresa ativa no topo da página principal
