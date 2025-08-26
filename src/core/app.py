@@ -7,15 +7,30 @@ from ofxparse import OfxParser
 import io
 import zipfile
 import os
-from urllib.parse import quote_plus
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 import sqlalchemy
 import spacy
 import hashlib
 
-# Carregar variáveis de ambiente do arquivo .env
-load_dotenv()
+# --- Função para detectar ambiente ---
+def is_streamlit_cloud():
+    """Detecta se está rodando no Streamlit Cloud"""
+    return "STREAMLIT_SHARING" in os.environ or "streamlit" in os.getcwd().lower() or hasattr(st, 'secrets')
+
+# --- Carregar configurações baseado no ambiente ---
+if is_streamlit_cloud():
+    # No Streamlit Cloud, usar secrets
+    def get_config(key):
+        try:
+            return st.secrets[key]
+        except KeyError:
+            return ""
+else:
+    # Localmente, usar .env
+    load_dotenv()
+    def get_config(key):
+        return os.getenv(key, "")
 
 # --- Carregamento de Modelos e Recursos com Cache ---
 @st.cache_resource
@@ -24,10 +39,23 @@ def carregar_modelo_spacy():
     try:
         return spacy.load('pt_core_news_sm')
     except OSError:
-        st.error("Modelo 'pt_core_news_sm' não encontrado. Por favor, execute 'python -m spacy download pt_core_news_sm' no seu terminal.")
+        st.error("""
+        ❌ **Modelo 'pt_core_news_sm' não encontrado**
+        
+        **Para corrigir no Streamlit Cloud:**
+        1. Adicione ao `requirements.txt`:
+        ```
+        spacy>=3.4.0
+        https://github.com/explosion/spacy-models/releases/download/pt_core_news_sm-3.4.0/pt_core_news_sm-3.4.0-py3-none-any.whl
+        ```
+        2. Faça o redeploy da aplicação
+        
+        **Para corrigir localmente:**
+        Execute: `python -m spacy download pt_core_news_sm`
+        """)
         return None
 
-nlp = carregar_modelo_spacy()
+# --- Constantes ---
 COMPANY_SUFFIXES = [
     'LTDA', 'S/A', 'SA', 'ME', 'EIRELI', 'CIA', 'MEI', 'EPP', 'EIRELE', 'S.A', 
     'ASSOCIACAO', 'SEGURANCA', 'AUTOMACAO', 'ROBOTICA', 'TECNOLOGIA', 
@@ -38,51 +66,87 @@ COMPANY_SUFFIXES = [
     'EXPRESS', 'TRANSPORTES'
 ]
 
-
 # --- Conexão com o Banco de Dados (PostgreSQL) ---
+@st.cache_resource
 def init_connection():
-    """Inicializa a conexão com o banco de dados PostgreSQL.
-
-    Sanitiza valores lidos do .env (remove aspas externas) e faz
-    URL-encoding do usuário/senha para evitar problemas com espaços
-    e caracteres especiais. Adiciona sslmode=require para conexões
-    com Supabase quando necessário.
-    """
+    """Inicializa a conexão com o banco de dados PostgreSQL"""
     try:
-        # Lê variáveis do ambiente com fallback para string vazia
-        raw_user = os.getenv('SUPABASE_USER', '') or ''
-        raw_password = os.getenv('SUPABASE_PASSWORD', '') or ''
-        raw_host = os.getenv('SUPABASE_HOST', '') or ''
-        raw_port = os.getenv('SUPABASE_PORT', '') or ''
-        raw_db = os.getenv('SUPABASE_DB_NAME', '') or ''
-
-        # Remove aspas externas simples ou duplas se houver
-        def _strip_quotes(s: str) -> str:
-            s = s.strip()
-            if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
-                return s[1:-1]
-            return s
-
-        user = _strip_quotes(raw_user)
-        password = _strip_quotes(raw_password)
-        host = _strip_quotes(raw_host)
-        port = _strip_quotes(raw_port)
-        dbname = _strip_quotes(raw_db)
-
-        # Faz URL-encoding de user e password para evitar erros com espaços e chars especiais
-        user_enc = quote_plus(user)
-        password_enc = quote_plus(password)
-
-        # Monta a URL de conexão e força sslmode=require (compatível com Supabase)
-        db_url = f"postgresql+psycopg2://{user_enc}:{password_enc}@{host}:{port}/{dbname}?sslmode=require"
-
-        engine = create_engine(db_url)
+        # Verificar se as configurações existem
+        required_configs = ['SUPABASE_USER', 'SUPABASE_PASSWORD', 'SUPABASE_HOST', 'SUPABASE_PORT', 'SUPABASE_DB_NAME']
+        missing_configs = [config for config in required_configs if not get_config(config)]
+        
+        if missing_configs:
+            st.error(f"❌ **Configurações ausentes:** {', '.join(missing_configs)}")
+            if is_streamlit_cloud():
+                st.info("""
+                📝 **Configure os secrets no Streamlit Cloud:**
+                1. Acesse o dashboard do Streamlit
+                2. Vá em Settings → Secrets
+                3. Adicione as configurações no formato:
+                ```toml
+                SUPABASE_USER = "seu_usuario"
+                SUPABASE_PASSWORD = "sua_senha"
+                SUPABASE_HOST = "seu_host"
+                SUPABASE_PORT = "5432"
+                SUPABASE_DB_NAME = "postgres"
+                ```
+                """)
+            else:
+                st.info("📝 Verifique o arquivo `.env` na raiz do projeto")
+            st.stop()
+        
+        # Construir URL de conexão
+        db_url = (
+            f"postgresql+psycopg2://{get_config('SUPABASE_USER')}:"
+            f"{get_config('SUPABASE_PASSWORD')}@{get_config('SUPABASE_HOST')}:"
+            f"{get_config('SUPABASE_PORT')}/{get_config('SUPABASE_DB_NAME')}"
+        )
+        
+        # Criar engine com configurações otimizadas para Streamlit Cloud
+        engine = create_engine(
+            db_url,
+            pool_recycle=300,      # Reciclar conexões a cada 5 min
+            pool_pre_ping=True,    # Verificar conexões antes de usar
+            pool_timeout=20,       # Timeout para conexões
+            max_overflow=0,        # Não permitir overflow de conexões
+            connect_args={
+                "sslmode": "require",     # SSL obrigatório para Supabase
+                "connect_timeout": 10     # Timeout de conexão
+            }
+        )
+        
+        # Testar conexão
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT 1"))
+            result.fetchone()
+        
+        st.success(f"✅ Conectado ao banco: {get_config('SUPABASE_HOST')}")
         return engine
+        
     except Exception as e:
-        st.error(f"Erro ao conectar com o banco de dados: {e}")
-        st.info("Verifique se as variáveis de ambiente (HOST, USER, PASSWORD, etc.) estão corretas no arquivo .env.")
+        st.error(f"❌ **Erro ao conectar com o banco:** {str(e)}")
+        
+        # Diagnóstico mais detalhado
+        if "authentication failed" in str(e).lower():
+            st.info("🔧 **Erro de autenticação:** Verifique usuário e senha")
+        elif "does not exist" in str(e).lower():
+            st.info("🔧 **Banco não encontrado:** Verifique o nome do banco")
+        elif "could not connect" in str(e).lower():
+            st.info("🔧 **Erro de conexão:** Verifique host e porta")
+        else:
+            st.info("🔧 Verifique todas as credenciais do Supabase")
+        
+        # Mostrar debug info se habilitado
+        if st.checkbox("🔍 Mostrar informações de debug"):
+            st.write("**Ambiente detectado:**", "Streamlit Cloud" if is_streamlit_cloud() else "Local")
+            st.write("**Host configurado:**", get_config('SUPABASE_HOST') or "❌ Não configurado")
+            st.write("**Usuário configurado:**", get_config('SUPABASE_USER') or "❌ Não configurado")
+            st.write("**Porta configurada:**", get_config('SUPABASE_PORT') or "❌ Não configurado")
+        
         st.stop()
 
+# --- Inicialização dos recursos ---
+nlp = carregar_modelo_spacy()
 engine = init_connection()
 
 # --- Funções do Banco de Dados (ANTIGAS E NOVAS) ---
